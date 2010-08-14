@@ -3,9 +3,9 @@ gprofview - a gprof log viewer
 
 This is a ncurses-based text-mode gprof log viewer.
 
-Author: Yuji Hirose <yuji.hirose.bug at gmail.com>
-License: GPLv2
-Requirement: Ruby 1.8.x
+* Author: Yuji Hirose <yuji.hirose.bug at gmail.com>
+* License: GPLv2
+* Requirement: Ruby 1.8.x
 
 Command line usage
 ------------------
