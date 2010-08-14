@@ -1,0 +1,703 @@
+#!/usr/bin/env ruby
+#
+# Copyright (C) 2008 Yuji Hirose
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2, or (at your option)
+# any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program (see the file COPYING); if not, write to the
+# Free Software Foundation, Inc.,
+# 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA
+#
+
+require 'curses'
+
+#-------------------------------------------------------------------------------
+# for debug
+#-------------------------------------------------------------------------------
+
+DBG_WIN_HIGHT = 0 # for debug
+
+class DebugWindow
+  def initialize(h, w, y, x)
+    ss = Curses.stdscr
+    @w = ss.subwin(h, w, y, x) if h > 0
+  end
+  def show(s)
+    if @w
+      @w.setpos(0, 0);
+      @w.addstr(s[0, @w.maxx].ljust(@w.maxx))
+      @w.refresh
+    end
+  end
+end
+
+#-------------------------------------------------------------------------------
+# min/max
+#-------------------------------------------------------------------------------
+
+def min(a, b); a < b ? a : b; end
+def max(a, b); a > b ? a : b; end
+
+#-------------------------------------------------------------------------------
+# class Gprof
+#-------------------------------------------------------------------------------
+
+class Gprof
+
+  FLOAT = '(\d+\.\d+)'
+  COUNT = '(\d+(?:[+/]\d+)?)'
+  INT = '(\d+)'
+  ID = '(?:\[(\d+)\])'
+  NAME = '(.+)'
+
+  CALL_GRAPH = %r{
+granularity: each sample hit covers \d+ byte\(s\) (?:for \d+\.\d+% of #{FLOAT} seconds|no time propagated)
+
+index % time    self  children    called     name
+(.*?)(
+ This table|)}m
+
+  CALL_GRAPH_NEIGHBOR_ENTRY =
+    %r{^\s+#{FLOAT}?\s+#{FLOAT}?\s+#{INT}?([/+])?#{INT}?\s+#{NAME} #{ID}}
+
+  CALL_GRAPH_SELF_ENTRY =
+    %r{^#{ID}\s+#{FLOAT}\s+#{FLOAT}\s+#{FLOAT}\s+#{INT}?(\+)?#{INT}?\s+#{NAME} #{ID}}
+
+  def initialize(s)
+
+    # check if it is gprof result file.
+    raise unless s =~ CALL_GRAPH
+
+    @grand_total = $1 ? $1.to_f : 0.0
+    @resultset = []
+
+    # split the call graph table.
+    graph_table = $2.split(/-----------------------------------------------\n/)
+
+    # parse graph table.
+    graph_table.each do |graph_entry|
+
+      callgraph = []
+
+      lines = graph_entry.split(/\n/)
+
+      # parse callers...
+      i = 0
+      i += 1 if i < lines.size and lines[i] =~ /<spontaneous>/
+      while i < lines.size and lines[i] =~ CALL_GRAPH_NEIGHBOR_ENTRY
+        callgraph.push({
+          :type => :parent,
+          :self => $1.to_f,
+          :children => $2.to_f,
+          :count => $3 ? $3.to_i : 0,
+          :count_type => $4 ? $4.dup : " ",
+          :total_count => $5 ? $5.to_i : 0,
+          :name => $6.dup,
+          :id => $7 ? $7.to_i - 1 : nil })
+        i += 1
+      end
+
+      # parse self...
+      lines[i] =~ CALL_GRAPH_SELF_ENTRY
+      node = {
+        :type => :self,
+        :total_percentage => $2.to_f,
+        :total => $3.to_f + $4.to_f,
+        :self_percentage => @grand_total > 0 ? $3.to_f / @grand_total * 100.0 : 0,
+        :self => $3.to_f,
+        :children => $4.to_f,
+        :count => $5 ? $5.to_i : 0,
+        :count_type => $6 ? $6.dup : " ",
+        :total_count => $7 ? $7.to_i : 0,
+        :name => $8.dup,
+        :id => $1.to_i - 1,
+      }
+      callgraph.push node
+      i += 1
+
+      # parse children...
+      while i < lines.size and lines[i] =~ CALL_GRAPH_NEIGHBOR_ENTRY
+        callgraph.push({
+          :type => :child,
+          :self => $1.to_f,
+          :children => $2.to_f,
+          :count => $3 ? $3.to_i : 0,
+          :count_type => $4 ? $4.dup : " ",
+          :total_count => $5 ? $5.to_i : 0,
+          :name => $6,
+          :id => $7 ? $7.to_i - 1 : nil })
+        i += 1
+      end
+
+      node[:callgraph] = callgraph
+
+      resultset.push node
+    end
+    @flatlist = @resultset
+  end
+
+  def clear
+    @resultset = @flatlist
+  end
+
+  def resultset
+    @resultset
+  end
+
+  def callgraph(id)
+    flatlist_id = 0
+    @flatlist.each_with_index do |x, i|
+      if x[:id] == id
+        flatlist_id = i
+        break
+      end
+    end
+    @flatlist[flatlist_id][:callgraph]
+  end
+
+  def grand_total
+    @grand_total
+  end
+
+  def select(pattern)
+    @resultset = @resultset.select{|a| a[:name] =~ pattern }
+  end
+
+  def reject(pattern)
+    @resultset = @resultset.select{|a| not a[:name] =~ pattern }
+  end
+
+  def sort(field)
+    @resultset = @resultset.sort{|a,b| (a[field] <=> b[field]) * -1 }
+  end
+
+  def self_id(id)
+    callgraph(id).each_with_index do |x, i|
+      return i if x[:type] == :self
+    end
+  end
+
+  def find(dataset, cur, word, forward)
+    if forward == true
+      (cur...dataset.size).each do |i|
+        return i if dataset[i][:name] =~ /#{word}/
+      end
+    else
+      i = cur
+      while i >= 0
+        return i if dataset[i][:name] =~ /#{word}/
+        i -= 1
+      end
+    end
+    nil
+  end
+end
+
+#-------------------------------------------------------------------------------
+# help
+#-------------------------------------------------------------------------------
+
+HELP_TEXT = <<EOS
+
+  gprofview Manual
+  ================
+
+      General operation
+      -----------------
+
+        'c'    clear filter result
+        'e'    filter entries (include)
+        'i'    filter entries (exclude)
+        'q'    quit
+        'v'    change view type (percentage <-> time)
+        's'    change sort type (total -> self -> count)
+        't'    go back to flatlist view 
+        'u'    go back one level
+        '?'    you know what it is...
+        SPACE  go to callgraph (ENTER key can also be used.)
+
+      Cursor movement
+      ---------------
+
+        'g'     go to top
+        'G'     go to bottom
+        'h'     scroll left
+        'j'     move cursor down
+        'k'     move cursor up
+        'l'     scroll right
+        'n'     find next
+        'N'     find previous
+        'zz'    go to center of screen
+        '0'     go to left
+        '/'     find
+        CTRL-B  page up
+        CTRL-D  half page down
+        CTRL-E  scroll up
+        CTRL-F  page down
+        CTRL-U  half page up
+        CTRL-Y  scroll down
+
+      Please report any bugs to <yuji.hirose.bug at gmail.com>.
+EOS
+
+def help
+  ss = Curses.stdscr
+  w = ss.subwin(ss.maxy - 2 - DBG_WIN_HIGHT, ss.maxx, 0, 0)
+  w.clear
+  w.setpos(0, 0)
+  w.addstr(HELP_TEXT)
+  w.refresh
+  Curses.getch
+  w.close
+end
+
+#-------------------------------------------------------------------------------
+# show_view_line
+#-------------------------------------------------------------------------------
+
+def show_view_line(w, top, i, cur, s, word, sel)
+  s = s[0, w.maxx].ljust(w.maxx)
+  unless word.empty?
+    pos = 0
+    while npos = s.index(/#{word}/, pos)
+      # normal
+      w.setpos(i, pos)
+      sel ? w.standout : w.standend
+      w.addstr(s[pos...npos])
+
+      # word
+      w.setpos(i, npos)
+      sel ? w.standend : w.standout
+      match_size = $&.size
+      w.addstr(s[npos, match_size])
+
+      pos = npos + match_size
+    end
+    sel ? w.standout : w.standend
+    w.setpos(i, pos)
+    w.addstr(s[pos...s.size])
+  else
+    sel ? w.standout : w.standend
+    w.setpos(i, 0)
+    w.addstr(s)
+  end
+  w.standend
+end
+
+#-------------------------------------------------------------------------------
+# show_flatlist
+#-------------------------------------------------------------------------------
+
+def show_flatlist(header, footer, view, view_type, gprof, top, cur, name_off, word)
+
+  def show_header(w, view_type)
+    case view_type
+    when :time
+      s0 = "  total     self         count              name"
+      s1 = "--------- --------- --------------------- --------"
+    when :percentage
+      s0 = "  t%     s%        count              name"
+      s1 = "------ ------ --------------------- --------"
+    end
+    w.setpos(0, 0)
+    w.addstr(s0[0, w.maxx].ljust(w.maxx))
+    w.setpos(1, 0)
+    w.addstr(s1[0, w.maxx].ljust(w.maxx, '-'))
+    w.refresh
+  end
+
+  def show_footer(w, gprof, cur)
+    s = "total %.2f secs   %d/%d   (c)lear (e)xclude (i)nclude (q)uit (v)iew (s)ort (?)" %
+      [ gprof.grand_total,
+        gprof.resultset.empty? ? 0 : cur + 1,
+        gprof.resultset.size ]
+    w.standout
+    w.setpos(0, 0)
+    w.addstr(s[0, w.maxx].ljust(w.maxx))
+    w.standend
+    w.refresh
+  end
+
+  def show_view(w, view_type, gprof, top, cur, name_off, word)
+
+    def get_view_line(x, view_type, name_off)
+      case view_type
+      when :time
+        "%9.2f %9.2f %10d%1s%-10s %s" %
+          [ x[:total],
+            x[:self],
+            x[:count],
+            x[:count_type],
+            x[:total_count] > 0 ? x[:total_count] : "",
+            x[:name][name_off...x[:name].size] ]
+      when :percentage
+        "%6.2f %6.2f %10d%1s%-10s %s" %
+          [ x[:total_percentage],
+            x[:self_percentage],
+            x[:count],
+            x[:count_type],
+            x[:total_count] > 0 ? x[:total_count] : "",
+            x[:name][name_off...x[:name].size] ]
+      end
+    end
+
+    (0...w.maxy).each do |i|
+      ii = i + top
+      s = ''
+      sel = ii == cur
+      if ii < gprof.resultset.size and not gprof.resultset.empty?
+        x = gprof.resultset[ii]
+        s = get_view_line(x, view_type, name_off)
+      end
+      show_view_line(w, top, i, cur, s, word, sel)
+    end
+    w.refresh
+  end
+
+  show_header(header, view_type)
+  show_footer(footer, gprof, cur)
+  show_view(view, view_type, gprof, top, cur, name_off, word)
+end
+
+#-------------------------------------------------------------------------------
+# show_callgraph
+#-------------------------------------------------------------------------------
+
+def show_callgraph(header, footer, view, view_type, gprof, id, top, cur, name_off, word)
+
+  def show_header(w, view_type)
+    case view_type
+    when :time
+      s0 = "  total     self    children    r%        count              name"
+      s1 = "--------- --------- --------- ------ --------------------- --------"
+    when :percentage
+      s0 = "  t%     s%     c%     r%        count              name"
+      s1 = "------ ------ ------ ------ --------------------- --------"
+    end
+    w.setpos(0, 0)
+    w.addstr(s0[0, w.maxx].ljust(w.maxx))
+    w.setpos(1, 0)
+    w.addstr(s1[0, w.maxx].ljust(w.maxx, '-'))
+    w.refresh
+  end
+
+  def show_footer(w, gprof)
+    s = "total %.2f secs   (q)uit (v)iew (t)op (u)p (?)" % [gprof.grand_total]
+    w.standout
+    w.setpos(0, 0)
+    w.addstr(s[0, w.maxx].ljust(w.maxx))
+    w.standend
+    w.refresh
+  end
+
+  def show_view(w, view_type, gprof, id, top, cur, name_off, word)
+
+    def get_view_line(gprof, x, view_type, self_total, name_off)
+      case view_type
+      when :time
+        "%9s %9.2f %9.2f %6.2f %10d%1s%-10s %s" %
+          [ x[:total] ? "% 9.2f" % x[:total] : '',
+            x[:self],
+            x[:children],
+            self_total > 0 ? (x[:self] + x[:children]) / self_total * 100.0 : 0.0,
+            x[:count],
+            x[:count_type],
+            x[:total_count] > 0 ? x[:total_count] : '',
+            x[:name][name_off...x[:name].size] ]
+      when :percentage
+        "%6s %6.2f %6.2f %6.2f %10d%1s%-10s %s" %
+          [ x[:total_percentage] ? "%6.2f" % x[:total_percentage] : '',
+            gprof.grand_total > 0 ? x[:self] / gprof.grand_total * 100.0 : 0.0,
+            gprof.grand_total > 0 ? x[:children] / gprof.grand_total * 100.0 : 0.0,
+            self_total > 0 ? (x[:self] + x[:children]) / self_total * 100.0 : 0.0,
+            x[:count],
+            x[:count_type],
+            x[:total_count] > 0 ? x[:total_count] : '',
+            x[:name][name_off...x[:name].size] ]
+      end
+    end
+
+    cg = gprof.callgraph(id)
+    self_id = gprof.self_id(id)
+    self_total = cg[self_id][:total]
+
+    (0...w.maxy).each do |i|
+      ii = i + top;
+      s = ''
+      sel = ii == cur
+      if ii < cg.size
+        x = cg[ii]
+        s = get_view_line(gprof, x, view_type, self_total, name_off)
+        sel |= x[:type] == :self
+      end
+      show_view_line(w, top, i, cur, s, word, sel)
+    end
+
+    w.refresh
+  end
+
+  show_header(header, view_type)
+  show_footer(footer, gprof)
+  show_view(view, view_type, gprof, id, top, cur, name_off, word)
+end
+
+#-------------------------------------------------------------------------------
+# move_cursor
+#-------------------------------------------------------------------------------
+
+def move_cursor(view, top, cur, name_off, size, ch)
+
+  case ch
+  when ?g
+    cur = 0
+  when ?G
+    cur = size - 1
+  when ?j
+    cur += 1
+  when ?k
+    cur -= 1
+  when ?h
+    name_off -= 4
+  when ?l
+    name_off += 4
+  when ?0
+    name_off = 0
+  when 6 # CTRL+F
+    cur += view.maxy
+    top = cur
+  when 2 # CTRL+B
+    cur -= view.maxy
+    top = cur - view.maxy + 1
+  when 4 # CTRL+D
+    cur += (view.maxy / 2)
+    top = cur
+  when 21 # CTRL+U
+    cur -= (view.maxy / 2)
+    top = cur - (view.maxy / 2) + 1
+  when 5 # CTRL+E 
+    cur += 1 if cur == top and top < size - view.maxy
+    top += 1
+  when 25 # CTRL+Y
+    cur -= 1 if cur == top + view.maxy - 1 and top > 0
+    top -= 1
+  when ?z
+    ch = Curses.getch
+    case ch
+    when ?z
+      top = cur - (view.maxy / 2) + 1
+    end
+  end
+
+  # validate positions
+  cur = max(min(cur, size - 1), 0)
+  top = min(cur,  top)
+  top = cur - view.maxy + 1 if cur > top + view.maxy - 1
+  top = size - view.maxy if top + view.maxy > size
+  top = max(top, 0)
+  name_off = max(name_off, 0)
+
+  return top, cur, name_off
+end
+
+#-------------------------------------------------------------------------------
+# input_command
+#-------------------------------------------------------------------------------
+
+def input_command(w, prompt)
+  w.setpos(0, 0)
+  w.addstr(prompt[0, w.maxx].ljust(w.maxx))
+  w.refresh
+  w.setpos(0, prompt.length)
+  Curses.curs_set(1)
+  Curses.echo
+  str = w.getstr
+  Curses.curs_set(0)
+  Curses.noecho
+  str
+end
+
+#-------------------------------------------------------------------------------
+# main
+#-------------------------------------------------------------------------------
+
+# parameter check
+if ARGV.size < 1
+  puts "usage: gprofview [file]"
+  exit -1
+end
+
+# create gprof object from profiler output
+begin
+  gprof = Gprof.new(open(ARGV.shift).read)
+rescue
+  puts "gprof output is required..."
+  exit -1
+end
+
+# initlize curses library
+Curses.init_screen
+Curses.raw
+Curses.curs_set(0)
+Curses.noecho
+
+# windows setup
+ss = Curses.stdscr
+header = ss.subwin(2, ss.maxx, 0, 0)
+view = ss.subwin(ss.maxy - 4 - DBG_WIN_HIGHT, ss.maxx, 2, 0)
+footer = ss.subwin(1, ss.maxx, ss.maxy - 2 - DBG_WIN_HIGHT, 0)
+command = ss.subwin(1, ss.maxx, ss.maxy - 1 - DBG_WIN_HIGHT, 0)
+debug = DebugWindow.new(DBG_WIN_HIGHT, ss.maxx, ss.maxy - DBG_WIN_HIGHT, 0)
+
+# initialize state variables
+mode = :flatlist
+id = 0
+top = 0
+cur = 0
+name_off = 0
+view_stack = []
+view_type = :percentage
+sort_type = :total
+word = ''
+
+# main loop
+loop do
+
+  # show screen
+  case mode
+  when :flatlist
+    show_flatlist(header, footer, view, view_type, gprof, top, cur, name_off, word)
+  when :callgraph
+    show_callgraph(header, footer, view, view_type, gprof, id, top, cur, name_off, word)
+  end
+
+  # input char
+  ch = Curses.getch
+  #debug.show(sprintf("key:%d", ch))
+
+  # general operations
+  case ch
+  when ?q # quit
+    break
+  when ?? # help
+    help
+  end
+
+  # window navigation
+  unless gprof.resultset.empty?
+    case ch
+    when ?t
+      if mode == :callgraph
+        id, top, cur = view_stack[0]
+        view_stack.clear
+        mode = :flatlist
+      end
+    when ?u
+      if mode == :callgraph
+        id, top, cur = view_stack.pop
+        mode = :flatlist if view_stack.empty?
+      end
+    when 10, 13, 32 # CR/LF or Space
+      view_stack.push [id, top, cur]
+      if mode == :flatlist
+        mode = :callgraph
+        id = gprof.resultset[cur][:id]
+      else
+        id = gprof.callgraph(id)[cur][:id]
+      end
+      top = 0
+      cur = gprof.self_id(id)
+    when ?v
+      if view_type == :percentage
+        view_type = :time
+      else
+        view_type = :percentage
+      end
+    end
+  end
+
+  # filtering, sorting and search
+  if mode == :flatlist
+    gprof.clear if ch == ?c
+    unless gprof.resultset.empty?
+      case ch
+      when ?i
+        str = input_command(command, 'include:')
+        unless str.empty?
+          gprof.select(/#{str}/)
+          top = 0
+          cur = 0
+        end
+      when ?e
+        str = input_command(command, 'exclude:')
+        unless str.empty?
+          gprof.reject(/#{str}/)
+          top = 0
+          cur = 0
+        end
+      when ?s
+        case sort_type
+        when :total
+          sort_type = :self
+        when :self
+          sort_type = :count
+        else
+          sort_type = :total
+        end
+        gprof.sort(sort_type);
+      end
+    end
+  end
+
+  # highlight word
+  if mode == :flatlist
+    dataset = gprof.resultset
+  else
+    dataset = gprof.callgraph(id)
+  end
+  case ch
+  when ?/
+    str = input_command(command, '/')
+    unless str.empty?
+      word = str
+      found = gprof.find(dataset, cur, word, true)
+      cur = found if found
+    end
+  when ?n
+    unless word.empty?
+      found = gprof.find(dataset, cur + 1, word, true)
+      cur = found if found
+    end
+  when ?N
+    unless word.empty?
+      found = gprof.find(dataset, cur - 1, word, false)
+      cur = found if found
+    end
+  end
+
+  # cursor movement and validating cursor positions
+  unless gprof.resultset.empty?
+    case mode
+    when :flatlist
+      size = gprof.resultset.size
+    when :callgraph
+      size = gprof.callgraph(id).size
+    end
+    top, cur, name_off = move_cursor(view, top, cur, name_off, size, ch);
+  end
+end
+
+Curses.curs_set(1)
+Curses.close_screen
+
+exit 0
+
+# vim: et ts=2 sw=2 ff=unix
